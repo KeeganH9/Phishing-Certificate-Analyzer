@@ -1,7 +1,7 @@
 # Phishing-Certificate-Analyzer
 
-For editors: go into the code space and copy the code into VS 
-called improved orbit and you should see the same readme as below, as well as analyzer.py (main file) and test_analyzer.py (test file)
+For editors: go into the code space ,improved orbit and copy the code into VS 
+and you should see the same readme as below, as well as analyzer.py (main file) and test_analyzer.py (test file)
 
 Requirements
 - Python 3 with pip and the venv module. Use the Python installation you used to develop the project; we have not established a minimum supported version.

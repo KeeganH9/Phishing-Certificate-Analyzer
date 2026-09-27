@@ -6,17 +6,16 @@ and you should see the same readme as below, as well as analyzer.py (main file) 
 Requirements
 - Python 3 with pip and the venv module. Use the Python installation you used to develop the project; we have not established a minimum supported version.
 - The analyzer.py file.
-- Internet access to install packages and connect to the target website.
 - The packages cryptography, requests, idna, tldextract, and rich.
 - For tests: pytest and test_analyzer.py.
-Python includes argparse, ipaddress, socket, ssl, datetime, and urllib.parse. You do not need to install those modules.
+Python includes argparse, ipaddress, socket, ssl, datetime, and urllib.parse.
 
 Open Command Prompt and run:
 
 python --version
 python -m pip --version
 
-make a directory for the files mine is 
+make a directory for the files, mine is 
 
 cd /d "C:\Users\keegan\Documents\PhishCert"
 

@@ -46,3 +46,5 @@ you can leave the VE with the command: deactivate
 To run the test run the command: 
 
 python -m pytest test_analyzer.py -v
+
+The files analyzer.py and test_analyzer.py are in the codespace.

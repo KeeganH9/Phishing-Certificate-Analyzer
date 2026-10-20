@@ -2,8 +2,10 @@ import argparse
 import ipaddress
 import socket
 import ssl
+import time
+from html.parser import HTMLParser
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urlunparse, unquote
 
 import idna
 import requests
@@ -13,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 
 console = Console()
@@ -20,23 +23,65 @@ console = Console()
 #this functions allows input of blank.com or https://blank.com/search 
 
 def normalize_target(target):
-    """Convert a URL or domain into a hostname."""
+    """Return a validated hostname and TLS port."""
+    target = target.strip()
+
+    if not target or any(character.isspace() for character in target):
+        raise ValueError("Enter a domain or HTTPS URL without spaces.")
+
+    # Allow a bare IPv4 or IPv6 address.
+    try:
+        address = ipaddress.ip_address(target)
+    except ValueError:
+        pass
+    else:
+        return str(address), 443
+
     if "://" not in target:
         target = "https://" + target
 
-    parsed_url = urlparse(target)
-    hostname = parsed_url.hostname
+    parsed = urlparse(target)
 
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Use an HTTPS URL or a bare domain.")
+
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing usernames or passwords are not supported.")
+
+    hostname = parsed.hostname
     if not hostname:
-        raise ValueError("Please enter a valid website or domain.")
+        raise ValueError("The URL must contain a hostname.")
 
-    return hostname.lower()
+    port = parsed.port  # Raises ValueError for invalid ports.
+    if port is None:
+        port = 443
+
+    if not 1 <= port <= 65535:
+        raise ValueError("The port must be between 1 and 65535.")
+
+    hostname = hostname.rstrip(".")
+
+    if "%" in hostname:
+        raise ValueError("Percent-encoded hosts and IPv6 zone IDs are not supported.")
+
+    try:
+        hostname = str(ipaddress.ip_address(hostname))
+    except ValueError:
+        try:
+            hostname = idna.encode(
+                hostname, uts46=True, std3_rules=True
+            ).decode("ascii").lower()
+        except idna.IDNAError as error:
+            raise ValueError(f"Invalid domain name: {error}") from error
+
+    return hostname, port
 
 #This connects to port 443 and gets websites certificate and converts whatever format its in to a format that python can look through. it also shows the TLS version and cipher.
 
 def fetch_certificate(hostname, port=443):
     """Connect to a website and retrieve its TLS certificate."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.hostname_checks_common_name = False
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
 
@@ -118,22 +163,36 @@ def dns_name_matches(hostname, certificate_name):
 
 
 def check_hostname_match(hostname, certificate):
-    """Check whether the certificate covers the requested hostname."""
+    """Match IP addresses against IP entries and domains against DNS entries."""
+    hostname = hostname.rstrip(".")
+
     try:
-        san_extension = certificate.extensions.get_extension_for_class(
+        target_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        target_ip = None
+
+    try:
+        san = certificate.extensions.get_extension_for_class(
             x509.SubjectAlternativeName
-        )
-        certificate_names = san_extension.value.get_values_for_type(
-            x509.DNSName
-        )
+        ).value
     except x509.ExtensionNotFound:
-        common_names = certificate.subject.get_attributes_for_oid(
-            NameOID.COMMON_NAME
-        )
-        certificate_names = [name.value for name in common_names]
+        return False
+
+    if target_ip is not None:
+        certificate_ips = san.get_values_for_type(x509.IPAddress)
+        return target_ip in certificate_ips
+
+    try:
+        ascii_hostname = idna.encode(
+            hostname, uts46=True
+        ).decode("ascii")
+    except idna.IDNAError:
+        return False
+
+    certificate_names = san.get_values_for_type(x509.DNSName)
 
     return any(
-        dns_name_matches(hostname, certificate_name)
+        dns_name_matches(ascii_hostname, certificate_name)
         for certificate_name in certificate_names
     )
 
@@ -215,6 +274,7 @@ def evaluate_certificate(hostname, certificate, certificate_info):
     return findings
 
 #These are small indicators but does not show proof of phishing.
+
 def analyze_domain(hostname):
     """Flag domain features for review without connecting to the website."""
     findings = []
@@ -291,14 +351,90 @@ def analyze_domain(hostname):
                     "points": 15,
                 })
 
+    # Flag brand names in subdomains of other registered domains.
+    domain_parts = get_domain_parts(hostname)
+    registered_domain = domain_parts["registered_domain"]
+    subdomain = domain_parts["subdomain"]
+
+    known_brand_domains = {
+        "paypal": {"paypal.com"},
+        "google": {"google.com"},
+        "microsoft": {"microsoft.com"},
+        "amazon": {"amazon.com"},
+        "apple": {"apple.com"},
+    }
+
+    subdomain_parts = {
+        part
+        for label in subdomain.split(".")
+        for part in label.split("-")
+        if part
+    }
+
+    if registered_domain != "Unknown suffix":
+        for brand, known_domains in known_brand_domains.items():
+            if (
+                brand in subdomain_parts
+                and registered_domain not in known_domains
+            ):
+                findings.append({
+                    "category": "Domain",
+                    "warning": (
+                        f"The subdomain contains '{brand}', but the "
+                        f"registered domain is '{registered_domain}'. "
+                        "Review for possible impersonation."
+                    ),
+                    "points": 15,
+                })
+
     return findings
 
-#This checks the certificate chain, the dates and the hostname 
-#This makes 1 TLS connection.
+
+
+
+
+
+#This code is what reads the website calls the functions. prints an error message if applicable
+#builds the two terminal tables, calculates the warning points
+#displays the the limitations.
+
+domain_extractor = tldextract.TLDExtract(
+    suffix_list_urls=(),
+    cache_dir=None,
+)
+
+
+def get_domain_parts(hostname):
+    """Identify the registered domain, subdomain, and public suffix."""
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        return {
+            "registered_domain": "Not applicable (IP address)",
+            "subdomain": "",
+            "suffix": "",
+        }
+
+    extracted = domain_extractor(hostname)
+    registered_domain = (
+        f"{extracted.domain}.{extracted.suffix}"
+        if extracted.domain and extracted.suffix
+        else "Unknown suffix"
+    )
+    return {
+        "registered_domain": registered_domain,
+        "subdomain": extracted.subdomain,
+        "suffix": extracted.suffix,
+    }
+
+
 def verify_certificate_trust(hostname, port=443):
-    """Check certificate trust, validity, and hostname using Python's TLS verifier."""
+    """Check certificate trust, validity dates, and hostname."""
     try:
         context = ssl.create_default_context()
+        context.hostname_checks_common_name = False
 
         with socket.create_connection(
             (hostname, port), timeout=8
@@ -324,28 +460,264 @@ def verify_certificate_trust(hostname, port=443):
         }
 
 
+class PageParser(HTMLParser):
+    """Collect static HTML references; never execute scripts or submit forms."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.forms = []
+        self.passwords = []
+        self.current_form = None
+        self.base = None
+        self.refreshes = []
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        if tag == "base" and self.base is None and attrs.get("href"):
+            self.base = attrs["href"]
+        if tag in ("a", "area") and attrs.get("href"):
+            self.links.append(("Link", attrs["href"], "download" in attrs))
+        if tag in ("script", "iframe") and attrs.get("src"):
+            self.links.append((tag.title(), attrs["src"], False))
+        if tag == "form":
+            self.current_form = attrs
+            self.forms.append(attrs)
+        if tag == "input" and (attrs.get("type") or "").lower() == "password":
+            self.passwords.append((attrs, self.current_form))
+        if tag == "meta" and (attrs.get("http-equiv") or "").lower() == "refresh":
+            self.refreshes.append(attrs.get("content") or "")
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.current_form = None
 
 
+def page_url(target, hostname, port):
+    """Preserve a supplied URL's path and query, including IPv6/custom ports."""
+    raw = target.strip()
+    try:
+        ipaddress.ip_address(raw)
+        path, query = "/", ""
+    except ValueError:
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        path, query = parsed.path or "/", parsed.query
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = host if port == 443 else f"{host}:{port}"
+    return urlunparse(("https", authority, path, "", query, ""))
 
 
+def inspect_page_html(html, url):
+    """Review static HTML; findings are indicators, not malware verdicts."""
+    parser = PageParser()
+    parser.feed(html)
+    findings = []
+    seen = set()
 
-#This code is what reads the website calls the functions. prints an error message if applicable
-#builds the two terminal tables, calculates the warning points
-#displays the the limitations.
+    def add(category, warning):
+        key = (category, warning)
+        if key not in seen:
+            seen.add(key)
+            findings.append({"category": category, "warning": warning})
+
+    def resolve(reference, base):
+        try:
+            result = urljoin(base, reference.strip())
+            parsed = urlparse(result)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+                return None
+            # Validate the destination but do not connect to it.
+            normalized_host, _ = normalize_target(
+                urlunparse(parsed._replace(scheme="https"))
+            )
+            return result, parsed, normalized_host
+        except (ValueError, UnicodeError):
+            return None
+
+    base = url
+    if parser.base:
+        resolved = resolve(parser.base, url)
+        if resolved:
+            base = resolved[0]
+        else:
+            add("Coverage", "Unsupported HTML base URL; relative destinations may be inaccurate.")
+
+    domains_checked = set()
+    downloads = (".exe", ".msi", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".apk")
+    for kind, reference, download in parser.links:
+        resolved = resolve(reference, base)
+        if not resolved:
+            continue
+        destination, parsed, host = resolved
+        if host not in domains_checked:
+            domains_checked.add(host)
+            for finding in analyze_domain(host):
+                add("Destination", f"{host}: {finding['warning']}")
+        if kind == "Link" and (download or unquote(parsed.path).lower().endswith(downloads)):
+            add("Download review", f"Download link: {destination}. File contents were not checked.")
+        if parsed.scheme == "http":
+            add("Unencrypted URL", f"{kind} uses HTTP: {destination}")
+
+    by_id = {form.get("id"): form for form in parser.forms if form.get("id")}
+    page_host = urlparse(url).hostname
+    for attrs, enclosing_form in parser.passwords:
+        form = by_id.get(attrs["form"]) if "form" in attrs else enclosing_form
+        if form is None:
+            add("Form review", "Password input has no resolved form; JavaScript submission is not analyzed.")
+            continue
+        action = (form.get("action") or "").strip()
+        resolved = resolve(action, base) if action else resolve(url, url)
+        if not resolved:
+            add("Form review", "Password form has an unsupported or invalid submission URL.")
+            continue
+        destination, parsed, host = resolved
+        if parsed.scheme == "http":
+            add("Password exposure", f"Password form submits over HTTP: {destination}")
+        if host != page_host:
+            add("Form review", f"Password form submits to another hostname: {host}. Review the intended login provider.")
+        if (form.get("method") or "get").lower() != "post":
+            add("Password exposure", "Password form does not declare POST; credentials may appear in a URL.")
+
+    for content in parser.refreshes:
+        add("Redirect review", f"HTML refresh directive: {content}. Destination was not followed.")
+    return {
+        "findings": findings,
+        "references": len(parser.links),
+        "forms": len(parser.forms),
+        "password_inputs": len(parser.passwords),
+    }
+
+
+def analyze_webpage(url):
+    """Fetch up to 2 MiB of HTML with TLS verification; never follow links."""
+    result = {"status": "Unavailable", "message": "", "findings": [],
+              "references": 0, "forms": 0, "password_inputs": 0}
+    try:
+        with requests.Session() as session:
+            # Avoid implicit .netrc credentials and environment proxy settings.
+            session.trust_env = False
+            with session.get(
+                url, timeout=(5, 8), stream=True, allow_redirects=False,
+                verify=True, headers={"User-Agent": "PhishCert/1.0", "Accept": "text/html"},
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("Location", "No Location header")
+                    result["message"] = f"HTTP {response.status_code}: redirect to {location}. Redirect not followed; run the destination URL to inspect its HTML."
+                    return result
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                if content_type not in ("text/html", "application/xhtml+xml"):
+                    result["message"] = f"Response is not declared HTML ({content_type or 'unknown content type'})."
+                    return result
+                body = bytearray()
+                started = time.monotonic()
+                partial = False
+                for chunk in response.iter_content(chunk_size=16384):
+                    if time.monotonic() - started > 20 or len(body) + len(chunk) > 2 * 1024 * 1024:
+                        partial = True
+                        break
+                    body.extend(chunk)
+                encoding = response.encoding or "utf-8"
+                try:
+                    html = body.decode(encoding, errors="replace")
+                except LookupError:
+                    html = body.decode("utf-8", errors="replace")
+                result.update(inspect_page_html(html, url))
+                result["status"] = "Partial" if partial else "Completed"
+                result["message"] = (
+                    "HTML size/time limit reached; only part of the page was inspected."
+                    if partial else "Static HTML inspected; linked pages and files were not fetched."
+                )
+    except (requests.RequestException, ValueError, OSError) as error:
+        result["message"] = f"Page analysis unavailable: {error}"
+    return result
+
+
+def print_page_report(result):
+    console.print("\nWebpage and Link Analysis", style="bold")
+    console.print(f"Status: {result['status']}", markup=False)
+    console.print(result["message"], markup=False)
+    if result["status"] in ("Completed", "Partial"):
+        console.print(
+            f"References: {result['references']} | Forms: {result['forms']} | "
+            f"Password inputs: {result['password_inputs']}", markup=False,
+        )
+        table = Table(title="Webpage and Link Findings")
+        table.add_column("Category")
+        table.add_column("Finding")
+        for finding in result["findings"][:100]:
+            table.add_row(Text(finding["category"]), Text(finding["warning"]))
+        if result["findings"]:
+            console.print(table)
+            if len(result["findings"]) > 100:
+                console.print(f"Showing 100 of {len(result['findings'])} findings.")
+        else:
+            console.print("No indicators found by the static HTML checks.")
+    console.print(
+        "Page findings do not add points to the certificate/domain score. "
+        "Downloads and external services can be legitimate. "
+        "This is not an adware or malware verdict; JavaScript, file contents, "
+        "form submission overrides, and reputation blocklists are not checked."
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Inspect a website's certificate and domain."
     )
     parser.add_argument("target", help="Domain or URL to analyze")
+    parser.add_argument(
+        "--domain-only",
+        action="store_true",
+        help="Analyze the domain without making network connections."
+    )
     args = parser.parse_args()
 
     try:
-        hostname = normalize_target(args.target)
-        connection = fetch_certificate(hostname)
+        hostname, port = normalize_target(args.target)
+        domain_parts = get_domain_parts(hostname)
+        if args.domain_only:
+            console.print(f"Domain: {hostname}", markup=False)
+            console.print("Mode: Offline domain analysis")
+            domain_details = Table(title="Domain Details")
+            domain_details.add_column("Field")
+            domain_details.add_column("Value")
+            domain_details.add_row("Registered domain", domain_parts["registered_domain"])
+            domain_details.add_row("Subdomain", domain_parts["subdomain"] or "None")
+            domain_details.add_row("Public suffix", domain_parts["suffix"] or "None identified")
+            console.print(domain_details)
+
+            warnings = Table(title="Domain Findings")
+            warnings.add_column("Category")
+            warnings.add_column("Warning")
+            warnings.add_column("Points", justify="right")
+
+            findings = analyze_domain(hostname)
+
+            for finding in findings:
+                warnings.add_row(
+                    finding["category"],
+                    finding["warning"],
+                    str(finding["points"])
+                )
+
+            if findings:
+                console.print(warnings)
+            else:
+                console.print("No warnings from the domain checks.")
+
+            score = min(
+                sum(finding["points"] for finding in findings), 100
+            )
+            console.print(f"\nProvisional domain risk score: {score}/100")
+            console.print(
+                "No certificate checks were performed. "
+                "This score is not a probability of phishing."
+            )
+            return
+        connection = fetch_certificate(hostname, port)
         certificate = connection["certificate"]
         info = analyze_certificate(certificate)
-        trust = verify_certificate_trust(hostname)
+        trust = verify_certificate_trust(hostname, port)
 
         findings = evaluate_certificate(hostname, certificate, info)
         findings.extend(analyze_domain(hostname))
@@ -362,11 +734,17 @@ def main():
         console.print(f"Analysis failed: {error}", markup=False)
         return
 
+    page_result = analyze_webpage(page_url(args.target, hostname, port))
+
     details = Table(title="PhishCert: Certificate Details")
     details.add_column("Field")
     details.add_column("Value")
 
     details.add_row("Hostname", hostname)
+    details.add_row("Port", str(port))
+    details.add_row("Registered domain", domain_parts["registered_domain"])
+    details.add_row("Subdomain", domain_parts["subdomain"] or "None")
+    details.add_row("Public suffix", domain_parts["suffix"] or "None identified")
     details.add_row("Issuer", info["issuer"])
     details.add_row(
         "Certificate domain names",
@@ -409,6 +787,8 @@ def main():
         "Certificate verification does not establish that a website is safe. "
         "Revocation checking is not implemented."
     )
+
+    print_page_report(page_result)
 
 
 if __name__ == "__main__":

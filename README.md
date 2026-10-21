@@ -1,6 +1,6 @@
 Phishing-Certificate-Analyzer
-For editors: go into the code space ,improved orbit and copy the code into VS
-and you should see the same readme as below, as well as analyzer.py (main file) and test_analyzer.py (test file)
+
+This project doesnt confirm adware or detect all kinds of phishing but it shows core certificate and domain checks, chain display, TLS 1.2/1.3 testing, report tables, and separate scores for confirmed legitimate sites, misconfigured certificate sites, and simulated phishing indicators so far.
 
 Requirements
 - Python 3.13 or newer for the certificate-chain API used by this version. We tested these scripts using Python 3.14.7 but we have not tested all other versions.

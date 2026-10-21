@@ -79,25 +79,30 @@ def normalize_target(target):
 #This connects to port 443 and gets websites certificate and converts whatever format its in to a format that python can look through. it also shows the TLS version and cipher.
 
 def fetch_certificate(hostname, port=443):
-    """Connect to a website and retrieve its TLS certificate."""
+    """Retrieve the website certificate and the chain sent by the server."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.hostname_checks_common_name = False
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
 
-    with socket.create_connection((hostname, port), timeout=8) as tcp_socket:
+    with socket.create_connection(
+        (hostname, port), timeout=8
+    ) as tcp_socket:
         with context.wrap_socket(
-            tcp_socket,
-            server_hostname=hostname
+            tcp_socket, server_hostname=hostname
         ) as tls_socket:
             certificate_bytes = tls_socket.getpeercert(binary_form=True)
-
             certificate = x509.load_der_x509_certificate(
                 certificate_bytes
             )
 
+            chain = [
+                x509.load_der_x509_certificate(cert_bytes)
+                for cert_bytes in tls_socket.get_unverified_chain()
+            ]
+
             return {
                 "certificate": certificate,
+                "chain": chain,
                 "tls_version": tls_socket.version(),
                 "cipher": tls_socket.cipher(),
             }
@@ -659,6 +664,52 @@ def print_page_report(result):
         "form submission overrides, and reputation blocklists are not checked."
     )
 
+def check_tls_versions(hostname, port=443):
+    """Test TLS 1.2 and 1.3 without requesting a webpage."""
+    results = []
+
+    versions = [
+        ("TLS 1.2", ssl.TLSVersion.TLSv1_2, ssl.HAS_TLSv1_2),
+        ("TLS 1.3", ssl.TLSVersion.TLSv1_3, ssl.HAS_TLSv1_3),
+    ]
+
+    for name, version, available in versions:
+        if not available:
+            results.append({
+                "version": name,
+                "status": "Not tested",
+                "details": "Your Python/OpenSSL build lacks this version.",
+            })
+            continue
+
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.minimum_version = version
+            context.maximum_version = version
+
+            with socket.create_connection(
+                (hostname, port), timeout=5
+            ) as tcp_socket:
+                with context.wrap_socket(
+                    tcp_socket, server_hostname=hostname
+                ) as tls_socket:
+                    results.append({
+                        "version": name,
+                        "status": "Supported",
+                        "details": f"Negotiated {tls_socket.version()}.",
+                    })
+
+        except (OSError, ValueError) as error:
+            results.append({
+                "version": name,
+                "status": "Inconclusive",
+                "details": str(error),
+            })
+
+    return results
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -675,15 +726,24 @@ def main():
     try:
         hostname, port = normalize_target(args.target)
         domain_parts = get_domain_parts(hostname)
+
         if args.domain_only:
             console.print(f"Domain: {hostname}", markup=False)
             console.print("Mode: Offline domain analysis")
+
             domain_details = Table(title="Domain Details")
             domain_details.add_column("Field")
             domain_details.add_column("Value")
-            domain_details.add_row("Registered domain", domain_parts["registered_domain"])
-            domain_details.add_row("Subdomain", domain_parts["subdomain"] or "None")
-            domain_details.add_row("Public suffix", domain_parts["suffix"] or "None identified")
+            domain_details.add_row(
+                "Registered domain", domain_parts["registered_domain"]
+            )
+            domain_details.add_row(
+                "Subdomain", domain_parts["subdomain"] or "None"
+            )
+            domain_details.add_row(
+                "Public suffix",
+                domain_parts["suffix"] or "None identified"
+            )
             console.print(domain_details)
 
             warnings = Table(title="Domain Findings")
@@ -696,7 +756,7 @@ def main():
             for finding in findings:
                 warnings.add_row(
                     finding["category"],
-                    finding["warning"],
+                    Text(finding["warning"]),
                     str(finding["points"])
                 )
 
@@ -708,25 +768,28 @@ def main():
             score = min(
                 sum(finding["points"] for finding in findings), 100
             )
-            console.print(f"\nProvisional domain risk score: {score}/100")
+            console.print(
+                f"\nProvisional domain risk score: {score}/100"
+            )
             console.print(
                 "No certificate checks were performed. "
                 "This score is not a probability of phishing."
             )
             return
+
         connection = fetch_certificate(hostname, port)
         certificate = connection["certificate"]
         info = analyze_certificate(certificate)
         trust = verify_certificate_trust(hostname, port)
+        tls_results = check_tls_versions(hostname, port)
 
         findings = evaluate_certificate(hostname, certificate, info)
         findings.extend(analyze_domain(hostname))
+
         if trust["status"] != "Passed":
             findings.append({
                 "category": "Verification",
-                "warning": (
-                    f"{trust['status']}: {trust['message']}"
-                ),
+                "warning": f"{trust['status']}: {trust['message']}",
                 "points": 0,
             })
 
@@ -734,35 +797,89 @@ def main():
         console.print(f"Analysis failed: {error}", markup=False)
         return
 
-    page_result = analyze_webpage(page_url(args.target, hostname, port))
+    page_result = analyze_webpage(
+        page_url(args.target, hostname, port)
+    )
 
+    # Display certificate and domain details.
     details = Table(title="PhishCert: Certificate Details")
     details.add_column("Field")
     details.add_column("Value")
 
     details.add_row("Hostname", hostname)
     details.add_row("Port", str(port))
-    details.add_row("Registered domain", domain_parts["registered_domain"])
+    details.add_row(
+        "Registered domain", domain_parts["registered_domain"]
+    )
     details.add_row("Subdomain", domain_parts["subdomain"] or "None")
-    details.add_row("Public suffix", domain_parts["suffix"] or "None identified")
-    details.add_row("Issuer", info["issuer"])
+    details.add_row(
+        "Public suffix", domain_parts["suffix"] or "None identified"
+    )
+    details.add_row("Issuer", Text(info["issuer"]))
     details.add_row(
         "Certificate domain names",
-        ", ".join(info["alternative_names"]) or "No DNS names listed"
+        Text(", ".join(info["alternative_names"]) or "No DNS names listed")
     )
     details.add_row("Valid from", str(info["valid_from"]))
     details.add_row("Expires", str(info["valid_until"]))
     details.add_row("Days remaining", str(info["days_remaining"]))
-    details.add_row("Negotiated TLS version", str(connection["tls_version"]))
+    details.add_row(
+        "Negotiated TLS version", str(connection["tls_version"])
+    )
     details.add_row(
         "Public key",
         f"{info['key_type']} ({info['key_size']} bits)"
     )
-    details.add_row("Signature algorithm", str(info["signature_algorithm"]))
+    details.add_row(
+        "Signature algorithm", str(info["signature_algorithm"])
+    )
     details.add_row("Certificate verification", trust["status"])
-    details.add_row("Verification details", trust["message"])
+    details.add_row("Verification details", Text(trust["message"]))
     console.print(details)
 
+    # Display the certificate chain supplied by the server.
+    chain_table = Table(title="Certificate Chain Sent by Server")
+    chain_table.add_column("#", justify="right")
+    chain_table.add_column("Subject")
+    chain_table.add_column("Issuer")
+    chain_table.add_column("Expires (UTC)")
+
+    for number, chain_cert in enumerate(connection["chain"], start=1):
+        chain_table.add_row(
+            str(number),
+            Text(chain_cert.subject.rfc4514_string()),
+            Text(chain_cert.issuer.rfc4514_string()),
+            chain_cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    console.print(chain_table)
+    console.print(
+        "This table shows the certificates supplied by the server. "
+        "See Certificate verification for the separate trust-check result."
+    )
+
+    # Display the results of the separate TLS-version probes.
+    tls_table = Table(title="TLS Version Checks")
+    tls_table.add_column("Version")
+    tls_table.add_column("Result")
+    tls_table.add_column("Details")
+
+    for result in tls_results:
+        tls_table.add_row(
+            result["version"],
+            result["status"],
+            Text(result["details"]),
+        )
+
+    console.print(tls_table)
+    console.print(
+        "A failed probe does not prove the server rejects that version. "
+        "Local TLS settings or connection problems can also cause failure. "
+        "TLS 1.0 and 1.1 are not tested. "
+        "Certificate trust is checked separately."
+    )
+
+    # Display certificate and domain warnings.
     warnings = Table(title="Findings")
     warnings.add_column("Category")
     warnings.add_column("Warning")
@@ -771,30 +888,64 @@ def main():
     for finding in findings:
         warnings.add_row(
             finding["category"],
-            finding["warning"],
+            Text(finding["warning"]),
             str(finding["points"])
         )
 
     if findings:
         console.print(warnings)
     else:
-        console.print("No warnings from the checks implemented so far.")
+        console.print(
+            "No warnings from the certificate and domain checks."
+        )
 
-    score = min(sum(finding["points"] for finding in findings), 100)
-    console.print(f"\nProvisional risk score: {score}/100")
-    console.print("This score is not a probability of phishing.")
+    # Calculate separate certificate and domain scores.
+    certificate_score = min(
+        sum(
+            finding["points"]
+            for finding in findings
+            if finding["category"] in ("Certificate", "Cryptography")
+        ),
+        100,
+    )
+
+    domain_score = min(
+        sum(
+            finding["points"]
+            for finding in findings
+            if finding["category"] == "Domain"
+        ),
+        100,
+    )
+
+    scores = Table(title="Provisional Scores")
+    scores.add_column("Assessment")
+    scores.add_column("Score", justify="right")
+
+    scores.add_row(
+        "Certificate configuration",
+        f"{certificate_score}/100"
+    )
+    scores.add_row(
+        "Domain indicators",
+        f"{domain_score}/100"
+    )
+
+    console.print(scores)
+    console.print(
+        "These scores summarize the checks implemented, "
+        "not the probability of phishing. "
+        "Review certificate verification separately, even when scores are zero. "
+        "Webpage findings do not add points."
+    )
     console.print(
         "Certificate verification does not establish that a website is safe. "
         "Revocation checking is not implemented."
     )
 
+    # Display the webpage and link findings.
     print_page_report(page_result)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
